@@ -61,7 +61,7 @@ function getEnabledTrackers(): Tracker[] {
                     services.push(
                         new PolymarketService(
                             telegram,
-                            [{ chatId: config.telegram.polyChatID }],
+                            [{ chatId: config.telegram.polyChatID }, { chatId: -1003468238602, topicId: 10961 }],
                             config.polymarket.screenshotEnabled
                         )
                     );
