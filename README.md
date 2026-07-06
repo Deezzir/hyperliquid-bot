@@ -16,7 +16,7 @@ The bot stores data in MongoDB, uses Redis for caching/deduplication, and sends 
   - **Fresh Wallet** — new wallets (≤50h) opening positions ≥$200K (excl. BTC/ETH)
   - **Whale Activity** — established wallets with positions ≥$300K (excl. BTC/ETH)
   - **Big Whale** — any position ≥$1M (all coins)
-  - **Big TWAP** — spot buy/sell accumulation over a 3h window with cycles ≤45s apart; per-coin minimums (BTC ≥$19M, ETH ≥$8M, SOL/HYPE/BNB ≥$5M, XRP/DOGE ≥$4M). Only these coins alert; all other spot trades are still collected for analysis.
+  - **Big TWAP** — perp or spot buy/sell accumulation executed as a burst of same-direction fills (fills ≤60s apart, avg cycle ≤45s, ≥5 fills); per-coin minimums (BTC ≥$19M, ETH ≥$8M, SOL/HYPE/BNB ≥$5M, XRP/DOGE ≥$4M). Only these coins alert; all other trades are still collected for analysis.
 - Re-alerts when tracked positions grow +9% from last alert
 - Hyperliquid manual tracking commands: `/track`, `/untrack`, `/tracked`, `/stats`
 - Polymarket and Stake whale alerts
@@ -79,8 +79,9 @@ Create a `.env` file in the project root.
 | `HL_FRESH_MAIN_COIN_MIN_USD` | `450000` | Fresh wallet min position (main coins) |
 | `HL_WHALE_MIN_USD` | `300000` | Whale activity min position |
 | `HL_BIG_WHALE_MIN_USD` | `1000000` | Big whale min position |
-| `HL_TWAP_WINDOW_MS` | `10800000` | TWAP detection window (3h) |
 | `HL_TWAP_MAX_INTERVAL_MS` | `45000` | Max avg interval between TWAP cycles (45s) |
+| `HL_TWAP_MAX_GAP_MS` | `60000` | Max gap between consecutive fills in a TWAP burst (60s) |
+| `HL_TWAP_MIN_FILLS` | `5` | Min number of fills to qualify as a TWAP burst |
 | `HL_TWAP_BTC_MIN_USD` | `19000000` | TWAP min traded notional for BTC |
 | `HL_TWAP_ETH_MIN_USD` | `8000000` | TWAP min traded notional for ETH |
 | `HL_TWAP_SOL_MIN_USD` | `5000000` | TWAP min traded notional for SOL |

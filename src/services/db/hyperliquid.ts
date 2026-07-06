@@ -3,6 +3,8 @@ import Logger from '../../common/logger';
 
 const logger = new Logger('HyperliquidDB');
 
+const TRADE_SNAPSHOT_CAP = 500;
+
 export type HyperTradeDirection = 'long' | 'short' | 'spot_buy' | 'spot_sell';
 
 export function isSpotDirection(direction: HyperTradeDirection): boolean {
@@ -227,16 +229,11 @@ export default class HyperliquidDBService {
                     existing.totalNotional += trade.notional;
                     existing.tradeCount += 1;
                     existing.lastTradeTime = Math.max(existing.lastTradeTime, trade.tradeTime);
-                    if (isSpotDirection(trade.direction)) {
-                        existing.trades.push({ ts: trade.tradeTime, size: trade.notional });
-                    }
+                    existing.trades.push({ ts: trade.tradeTime, size: trade.notional });
                     continue;
                 }
 
-                const trades_: TradeSnapshot[] = [];
-                if (isSpotDirection(trade.direction)) {
-                    trades_.push({ ts: trade.tradeTime, size: trade.notional });
-                }
+                const trades_: TradeSnapshot[] = [{ ts: trade.tradeTime, size: trade.notional }];
 
                 aggregated.set(key, {
                     filter: { wallet: trade.wallet, coin: trade.coin, dateKey, direction: trade.direction },
@@ -257,8 +254,8 @@ export default class HyperliquidDBService {
                         lastTradeTime: entry.lastTradeTime
                     }
                 };
-                if (isSpotDirection(entry.filter.direction) && entry.trades.length > 0) {
-                    update.$push = { trades: { $each: entry.trades } };
+                if (entry.trades.length > 0) {
+                    update.$push = { trades: { $each: entry.trades, $slice: -TRADE_SNAPSHOT_CAP } };
                 }
                 return {
                     updateOne: {
@@ -453,15 +450,6 @@ export default class HyperliquidDBService {
             logger.info(`Deleted ${result.deletedCount} old aggregation records`);
         } catch (error) {
             logger.error(`${error}`);
-            throw error;
-        }
-    }
-
-    static async deleteTrade(id: string): Promise<void> {
-        try {
-            await HyperAggregationModel.deleteOne({ _id: new mongoose.Types.ObjectId(id) }).exec();
-        } catch (error) {
-            logger.error(`Error deleting trade ${id}: ${error}`);
             throw error;
         }
     }

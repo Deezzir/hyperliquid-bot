@@ -44,20 +44,20 @@ Candidates are classified into one of four alert branches:
 
 3. **Big Whale** — any wallet, position >= $1M (`HL_BIG_WHALE_MIN_USD`)
 
-4. **Big TWAP** — spot buy or sell accumulation forming a TWAP pattern. A candidate qualifies only when, within a sliding 3h window (`HL_TWAP_WINDOW_MS`):
-  - the coin is one of BTC, ETH, SOL, XRP, DOGE, HYPE, BNB,
-  - there are >= 5 trades,
-  - the average interval between trades is <= 45s (`HL_TWAP_MAX_INTERVAL_MS`),
-  - the traded notional within the window meets the per-coin minimum:
-    - BTC: >= $19M (`HL_TWAP_BTC_MIN_USD`)
-    - ETH: >= $8M (`HL_TWAP_ETH_MIN_USD`)
-    - SOL: >= $5M (`HL_TWAP_SOL_MIN_USD`)
-    - XRP: >= $4M (`HL_TWAP_XRP_MIN_USD`)
-    - DOGE: >= $4M (`HL_TWAP_DOGE_MIN_USD`)
-    - HYPE: >= $5M (`HL_TWAP_HYPE_MIN_USD`)
-    - BNB: >= $5M (`HL_TWAP_BNB_MIN_USD`)
+4. **Big TWAP** — perp or spot buy/sell accumulation executed as a burst of same-direction fills. A candidate qualifies only when the most recent contiguous burst (consecutive fills each <= 60s apart, `HL_TWAP_MAX_GAP_MS`):
+   - the coin is one of BTC, ETH, SOL, XRP, DOGE, HYPE, BNB,
+   - has >= 5 fills (`HL_TWAP_MIN_FILLS`),
+   - has an average interval between fills <= 45s (`HL_TWAP_MAX_INTERVAL_MS`),
+   - the traded notional within the burst meets the per-coin minimum:
+     - BTC: >= $19M (`HL_TWAP_BTC_MIN_USD`)
+     - ETH: >= $8M (`HL_TWAP_ETH_MIN_USD`)
+     - SOL: >= $5M (`HL_TWAP_SOL_MIN_USD`)
+     - XRP: >= $4M (`HL_TWAP_XRP_MIN_USD`)
+     - DOGE: >= $4M (`HL_TWAP_DOGE_MIN_USD`)
+     - HYPE: >= $5M (`HL_TWAP_HYPE_MIN_USD`)
+     - BNB: >= $5M (`HL_TWAP_BNB_MIN_USD`)
 
-  The alert size, cycle stats and re-alert growth all reflect this 3h window. Spot trades for any other coin are still ingested and aggregated for analysis but never produce a TWAP alert. Sell-side TWAPs render with red 'selling' styling on the same channel.
+  The alert size, cycle stats and re-alert growth all reflect this burst. Perp TWAP alerts fire in addition to the position-based branch (Fresh/Whale/Big Whale) and are labelled `[PERP]`; spot alerts are labelled `[SPOT]`. Trades for any other coin are still ingested and aggregated for analysis but never produce a TWAP alert. Sell-side TWAPs (short / spot_sell) render with red 'selling' styling on the same channel.
 
 Re-alert only when growth exceeds dynamic threshold:
 

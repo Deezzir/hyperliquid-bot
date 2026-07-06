@@ -469,8 +469,10 @@ export default class HyperliquidService extends Tracker {
                     continue;
                 }
                 if (isSpotDirection(candidate.direction)) {
+                    await this.processSpotTwap(candidate, data.portfolio, data.state);
                     await this.processSpotAlertCandidate(candidate, data.portfolio, data.state);
                 } else {
+                    await this.processPerpTwap(candidate, data.portfolio, data.state);
                     await this.processAlertCandidate(candidate, data.portfolio, data.state);
                 }
             } catch (error) {
@@ -1019,7 +1021,6 @@ export default class HyperliquidService extends Tracker {
             this.logger.debug(
                 `Skipping alert for high-value perps trade (no position found): ${candidate.wallet} ${candidate.coin} ${formatCurrency(candidate.totalNotional)} (${candidate.direction})`
             );
-            await DBService.deleteTrade(candidate.id);
             return;
         }
         const direction: HyperTradeDirection = parseFloat(positionState.position.szi) > 0 ? 'long' : 'short';
@@ -1027,7 +1028,6 @@ export default class HyperliquidService extends Tracker {
             this.logger.debug(
                 `Skipping alert for high-value perps trade (direction mismatch): ${candidate.wallet} ${candidate.coin} ${formatCurrency(candidate.totalNotional)} (${candidate.direction})`
             );
-            await DBService.deleteTrade(candidate.id);
             return;
         }
         const upstreamTotalNotional = Math.abs(
@@ -1183,38 +1183,29 @@ export default class HyperliquidService extends Tracker {
         }
     }
 
-    private async processSpotAlertCandidate(
+    private async processPerpTwap(
         candidate: HyperAggregationRecord,
         portfolio: TraderPortfolio,
         state: TraderState
     ): Promise<void> {
-        this.logger.debug(
-            `Detected high-value spot trade: ${candidate.wallet} ${candidate.coin} ${formatCurrency(candidate.totalNotional)} (${candidate.direction})`
-        );
+        const twap = this.detectTwap(candidate);
+        if (!twap) return;
 
         const alertChannels = this.getChannelsForBranch('BIG_TWAP');
-        const isSell = isSpotSellDirection(candidate.direction);
-
-        const twap = this.detectTwap(candidate);
-        if (!twap) {
-            // Not a qualifying TWAP pattern - skip (spot alerts only fire for TWAP patterns)
-            this.logger.debug(
-                `Skipping spot (not TWAP pattern): ${candidate.wallet} ${candidate.coin} trades=${candidate.tradeCount}`
-            );
-            return;
-        }
-
-        candidate.trades = twap.windowTrades;
-        candidate.tradeCount = twap.windowTrades.length;
-        candidate.totalNotional = twap.windowNotional;
-        await DBService.updateTradeNotional(candidate.id, candidate.totalNotional);
-
         const branch: AlertBranch = 'BIG_TWAP';
+        const isSell = candidate.direction === 'short';
+
+        const twapCandidate: HyperAggregationRecord = {
+            ...candidate,
+            trades: twap.windowTrades,
+            tradeCount: twap.windowTrades.length,
+            totalNotional: twap.windowNotional
+        };
 
         const lastAlerts = await DBService.getLastAlerts(
-            candidate.wallet,
-            candidate.coin,
-            candidate.direction,
+            twapCandidate.wallet,
+            twapCandidate.coin,
+            twapCandidate.direction,
             alertChannels.map((c) => c.chatId),
             branch
         );
@@ -1223,20 +1214,20 @@ export default class HyperliquidService extends Tracker {
             const latestAlert = [...lastAlerts.values()].reduce((a, b) =>
                 new Date(a.sentAt) > new Date(b.sentAt) ? a : b
             );
-            const growth = candidate.totalNotional - latestAlert.totalNotional;
+            const growth = twapCandidate.totalNotional - latestAlert.totalNotional;
             const dynamicThreshold = Math.max(
                 (latestAlert.totalNotional * config.hyperliquid.minimalGrowthPercent) / 100,
                 config.hyperliquid.minimalGrowthUSD
             );
             if (growth < dynamicThreshold) {
                 this.logger.debug(
-                    `Skipping TWAP re-alert ${candidate.wallet} ${candidate.coin}: growth ${growth} < threshold ${dynamicThreshold}`
+                    `Skipping perp TWAP re-alert ${twapCandidate.wallet} ${twapCandidate.coin}: growth ${growth} < threshold ${dynamicThreshold}`
                 );
                 return;
             }
 
             const replyText = this.formatGrowingPositionMessage(
-                candidate.totalNotional,
+                twapCandidate.totalNotional,
                 latestAlert.totalNotional,
                 isSell ? '🔥 <b>Selling more</b>' : '🔥 <b>Growing position</b>'
             );
@@ -1254,10 +1245,10 @@ export default class HyperliquidService extends Tracker {
                     });
                 }
                 await DBService.insertAlert({
-                    wallet: candidate.wallet,
-                    coin: candidate.coin,
-                    direction: candidate.direction,
-                    totalNotional: candidate.totalNotional,
+                    wallet: twapCandidate.wallet,
+                    coin: twapCandidate.coin,
+                    direction: twapCandidate.direction,
+                    totalNotional: twapCandidate.totalNotional,
                     sentAt: new Date(),
                     chatId: channel.chatId,
                     messageId,
@@ -1267,12 +1258,120 @@ export default class HyperliquidService extends Tracker {
             return;
         }
 
-        // First TWAP alert
         this.logger.info(
-            `Sending BIG_TWAP alert: ${candidate.wallet} ${candidate.coin} ${formatCurrency(candidate.totalNotional)}`
+            `Sending BIG_TWAP alert (perp): ${twapCandidate.wallet} ${twapCandidate.coin} ${formatCurrency(twapCandidate.totalNotional)}`
         );
 
-        const result = await this.formatTwapAlert(candidate, state, portfolio);
+        const result = await this.formatTwapAlert(twapCandidate, state, portfolio, 'perp');
+        if (!result) return;
+        const { msg, buttons } = result;
+
+        for (let i = 0; i < alertChannels.length; i++) {
+            if (i > 0) await sleep(1000);
+            const channel = alertChannels[i];
+            const messageId = await this.tg.sendMessage(channel.chatId, msg, {
+                message_thread_id: channel.topicId,
+                reply_markup: buttons
+            });
+            await DBService.insertAlert({
+                wallet: twapCandidate.wallet,
+                coin: twapCandidate.coin,
+                direction: twapCandidate.direction,
+                totalNotional: twapCandidate.totalNotional,
+                sentAt: new Date(),
+                chatId: channel.chatId,
+                messageId,
+                branch
+            });
+        }
+    }
+
+    private async processSpotAlertCandidate(
+        _candidate: HyperAggregationRecord,
+        _portfolio: TraderPortfolio,
+        _state: TraderState
+    ): Promise<void> {}
+
+    private async processSpotTwap(
+        candidate: HyperAggregationRecord,
+        portfolio: TraderPortfolio,
+        state: TraderState
+    ): Promise<void> {
+        const twap = this.detectTwap(candidate);
+        if (!twap) return;
+
+        const alertChannels = this.getChannelsForBranch('BIG_TWAP');
+        const branch: AlertBranch = 'BIG_TWAP';
+        const isSell = isSpotSellDirection(candidate.direction);
+
+        const twapCandidate: HyperAggregationRecord = {
+            ...candidate,
+            trades: twap.windowTrades,
+            tradeCount: twap.windowTrades.length,
+            totalNotional: twap.windowNotional
+        };
+
+        const lastAlerts = await DBService.getLastAlerts(
+            twapCandidate.wallet,
+            twapCandidate.coin,
+            twapCandidate.direction,
+            alertChannels.map((c) => c.chatId),
+            branch
+        );
+
+        if (lastAlerts.size > 0) {
+            const latestAlert = [...lastAlerts.values()].reduce((a, b) =>
+                new Date(a.sentAt) > new Date(b.sentAt) ? a : b
+            );
+            const growth = twapCandidate.totalNotional - latestAlert.totalNotional;
+            const dynamicThreshold = Math.max(
+                (latestAlert.totalNotional * config.hyperliquid.minimalGrowthPercent) / 100,
+                config.hyperliquid.minimalGrowthUSD
+            );
+            if (growth < dynamicThreshold) {
+                this.logger.debug(
+                    `Skipping spot TWAP re-alert ${twapCandidate.wallet} ${twapCandidate.coin}: growth ${growth} < threshold ${dynamicThreshold}`
+                );
+                return;
+            }
+
+            const replyText = this.formatGrowingPositionMessage(
+                twapCandidate.totalNotional,
+                latestAlert.totalNotional,
+                isSell ? '🔥 <b>Selling more</b>' : '🔥 <b>Growing position</b>'
+            );
+            for (let i = 0; i < alertChannels.length; i++) {
+                if (i > 0) await sleep(1000);
+                const channel = alertChannels[i];
+                const prevAlert = lastAlerts.get(channel.chatId);
+                let messageId: number | undefined;
+                if (prevAlert?.messageId) {
+                    await this.tg.sendReply(channel.chatId, replyText, prevAlert.messageId);
+                    messageId = prevAlert.messageId;
+                } else {
+                    messageId = await this.tg.sendMessage(channel.chatId, replyText, {
+                        message_thread_id: channel.topicId
+                    });
+                }
+                await DBService.insertAlert({
+                    wallet: twapCandidate.wallet,
+                    coin: twapCandidate.coin,
+                    direction: twapCandidate.direction,
+                    totalNotional: twapCandidate.totalNotional,
+                    sentAt: new Date(),
+                    chatId: channel.chatId,
+                    messageId,
+                    branch
+                });
+            }
+            return;
+        }
+
+        this.logger.info(
+            `Sending BIG_TWAP alert (spot): ${twapCandidate.wallet} ${twapCandidate.coin} ${formatCurrency(twapCandidate.totalNotional)}`
+        );
+
+        const result = await this.formatTwapAlert(twapCandidate, state, portfolio, 'spot');
         if (!result) return;
         const { msg, buttons } = result;
 
@@ -1280,7 +1379,7 @@ export default class HyperliquidService extends Tracker {
         if (this.screenshotEnabled) {
             try {
                 screenshot = await this.screenshoter.capture(
-                    `${this.hypurrscanExplorer}/address/${candidate.wallet}#spot`,
+                    `${this.hypurrscanExplorer}/address/${twapCandidate.wallet}#spot`,
                     undefined,
                     () => {
                         const result = document.evaluate(
@@ -1297,7 +1396,9 @@ export default class HyperliquidService extends Tracker {
                     }
                 );
             } catch (err) {
-                this.logger.warn(`Screenshot failed for ${candidate.wallet} spot, sending alert without image: ${err}`);
+                this.logger.warn(
+                    `Screenshot failed for ${twapCandidate.wallet} spot, sending alert without image: ${err}`
+                );
             }
         }
         for (let i = 0; i < alertChannels.length; i++) {
@@ -1316,10 +1417,10 @@ export default class HyperliquidService extends Tracker {
                 });
             }
             await DBService.insertAlert({
-                wallet: candidate.wallet,
-                coin: candidate.coin,
-                direction: candidate.direction,
-                totalNotional: candidate.totalNotional,
+                wallet: twapCandidate.wallet,
+                coin: twapCandidate.coin,
+                direction: twapCandidate.direction,
+                totalNotional: twapCandidate.totalNotional,
                 sentAt: new Date(),
                 chatId: channel.chatId,
                 messageId,
@@ -1336,28 +1437,33 @@ export default class HyperliquidService extends Tracker {
         if (threshold === undefined) return null;
 
         const trades = candidate.trades || [];
-        if (trades.length < 5) return null;
+        if (trades.length < config.hyperliquid.twapMinFills) return null;
 
         const sorted = [...trades].sort((a, b) => a.ts - b.ts);
-        const windowStart = sorted[sorted.length - 1].ts - config.hyperliquid.twapWindowMs;
-        const windowTrades = sorted.filter((t) => t.ts >= windowStart);
-        if (windowTrades.length < 5) return null;
 
-        const windowNotional = windowTrades.reduce((sum, t) => sum + Math.abs(t.size), 0);
+        let burst: TradeSnapshot[] = [sorted[sorted.length - 1]];
+        for (let i = sorted.length - 2; i >= 0; i--) {
+            if (burst[0].ts - sorted[i].ts > config.hyperliquid.twapMaxGapMs) break;
+            burst.unshift(sorted[i]);
+        }
+        if (burst.length < config.hyperliquid.twapMinFills) return null;
+
+        const windowNotional = burst.reduce((sum, t) => sum + Math.abs(t.size), 0);
         if (windowNotional < threshold) return null;
 
-        const durationMs = windowTrades[windowTrades.length - 1].ts - windowTrades[0].ts;
+        const durationMs = burst[burst.length - 1].ts - burst[0].ts;
         if (durationMs <= 0) return null;
-        const avgIntervalMs = durationMs / (windowTrades.length - 1);
+        const avgIntervalMs = durationMs / (burst.length - 1);
         if (avgIntervalMs > config.hyperliquid.twapMaxIntervalMs) return null;
 
-        return { windowTrades, windowNotional };
+        return { windowTrades: burst, windowNotional };
     }
 
     private async formatTwapAlert(
         candidate: HyperAggregationRecord,
         state: TraderState,
-        portfolio: TraderPortfolio
+        portfolio: TraderPortfolio,
+        market: 'spot' | 'perp' = 'spot'
     ): Promise<{ msg: string; buttons: InlineKeyboardMarkup } | null> {
         if (!state.perp || !state.spot) return null;
         const accountTag = classifyAccountTag(state, portfolio);
@@ -1398,25 +1504,37 @@ export default class HyperliquidService extends Tracker {
         let price = 0;
 
         try {
-            const spotMeta = await this.api.fetchSpotMeta();
-            if (spotMeta) {
-                const token = spotMeta.tokens.find((t) => t.name === coinBase);
-                if (token) {
-                    const universe = spotMeta.universe.find((u) => u.tokens[0] === token.index);
-                    if (universe) {
-                        const ctx = spotMeta.assetMeta[universe.index];
-                        if (ctx) {
-                            volume24h = parseFloat(ctx.dayNtlVlm);
-                            price = parseFloat(ctx.midPx);
-                        }
+            if (market === 'perp') {
+                const perpMeta = await this.api.fetchPerpMeta();
+                if (perpMeta) {
+                    const index = perpMeta.universe.findIndex((u) => u.name === coinBase);
+                    const ctx = index >= 0 ? perpMeta.assetMeta[index] : undefined;
+                    if (ctx) {
+                        volume24h = parseFloat(ctx.dayNtlVlm);
+                        price = parseFloat(ctx.midPx);
                     }
+                }
+            } else {
+                const spotMeta = await this.api.fetchSpotMeta();
+                if (spotMeta) {
+                    const token = spotMeta.tokens.find((t) => t.name === coinBase);
+                    if (token) {
+                        const universe = spotMeta.universe.find((u) => u.tokens[0] === token.index);
+                        if (universe) {
+                            const ctx = spotMeta.assetMeta[universe.index];
+                            if (ctx) {
+                                volume24h = parseFloat(ctx.dayNtlVlm);
+                                price = parseFloat(ctx.midPx);
+                            }
+                        }
 
-                    const tokenId = '0x' + token.index.toString(16).padStart(64, '0');
-                    const details = await this.api.fetchTokenDetails(tokenId);
-                    if (details) {
-                        const supply = parseFloat(details.circulatingSupply);
-                        const px = parseFloat(details.midPx);
-                        if (supply > 0 && px > 0) marketCap = supply * px;
+                        const tokenId = '0x' + token.index.toString(16).padStart(64, '0');
+                        const details = await this.api.fetchTokenDetails(tokenId);
+                        if (details) {
+                            const supply = parseFloat(details.circulatingSupply);
+                            const px = parseFloat(details.midPx);
+                            if (supply > 0 && px > 0) marketCap = supply * px;
+                        }
                     }
                 }
             }
@@ -1440,7 +1558,7 @@ export default class HyperliquidService extends Tracker {
         const notionalPctOfMcap = marketCap > 0 ? (candidate.totalNotional / marketCap) * 100 : 0;
         const otherPositions = getTopPositions(state.perp!.assetPositions || [], '', 3);
 
-        const isSell = isSpotSellDirection(candidate.direction);
+        const isSell = market === 'perp' ? candidate.direction === 'short' : isSpotSellDirection(candidate.direction);
         const dirIcon = isSell ? '🔴' : '🟢';
         const actionWord = isSell ? 'selling' : 'buying';
         const sideBlock = isSell ? '🟥' : '🟩';
@@ -1452,16 +1570,19 @@ export default class HyperliquidService extends Tracker {
             cycleIntervalSec >= 60 ? `${Math.round(cycleIntervalSec / 60)}m` : `${cycleIntervalSec}s`;
 
         const lines = [
-            '🔄 <b>BIG TWAP DETECTED</b> 🔄',
+            `🔄 <b>BIG TWAP DETECTED</b> [${market.toUpperCase()}] 🔄`,
             '',
             `${dirIcon} <code>${formatCurrency(candidate.totalNotional)}</code> ${actionWord} <b>${escapeHtml(displayCoin)}</b> in ${durationStr} ${sideBlock}`,
             `~<code>${formatCurrency(perCycleAmount)}</code> every ${cycleIntervalStr}`,
             '',
             `σ: ${sigma.toFixed(2)}%  ·  Intensity: ${intensity.toFixed(2)}x`,
             `Cycle pressure: ${cyclePressure.toFixed(2)}x (0.5% depth)`,
-            `Notional: ${notionalPctOfMcap.toFixed(2)}% of mcap`,
             `🕐 ${durationStr} (${cycleCount} cycles)`
         ];
+
+        if (notionalPctOfMcap > 0) {
+            lines.splice(7, 0, `Notional: ${notionalPctOfMcap.toFixed(2)}% of mcap`);
+        }
 
         if (price > 0 || volume24h > 0 || marketCap > 0) {
             lines.push('');

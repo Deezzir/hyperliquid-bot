@@ -113,7 +113,7 @@ export const config = {
         excludeDexes: process.env['HL_EXCLUDE_DEXES']
             ? process.env['HL_EXCLUDE_DEXES'].split(',').map((d) => d.trim())
             : [],
-        minNotionalUSD: parseFloat(optionalEnv('HL_MIN_NOTIONAL_USD', '250000')),
+        minNotionalUSD: parseFloat(optionalEnv('HL_MIN_NOTIONAL_USD', '300000')),
         minSpotNotionalUSD: parseFloat(optionalEnv('HL_MIN_SPOT_NOTIONAL_USD', '300000')),
         aggregationWindowMs: parseInt(optionalEnv('HL_AGGREGATION_WINDOW_MS', String(3 * 24 * 60 * 60 * 1000)), 10),
         minimalGrowthPercent: parseFloat(optionalEnv('HL_POS_CHANGE_ALERT_PERCENT', '9')),
@@ -122,8 +122,9 @@ export const config = {
         freshMainCoinMinUSD: parseFloat(optionalEnv('HL_FRESH_MAIN_COIN_MIN_USD', '450000')),
         whaleMinUSD: parseFloat(optionalEnv('HL_WHALE_MIN_USD', '300000')),
         bigWhaleMinUSD: parseFloat(optionalEnv('HL_BIG_WHALE_MIN_USD', '1000000')),
-        twapWindowMs: parseInt(optionalEnv('HL_TWAP_WINDOW_MS', String(3 * 60 * 60 * 1000)), 10),
         twapMaxIntervalMs: parseInt(optionalEnv('HL_TWAP_MAX_INTERVAL_MS', String(45 * 1000)), 10),
+        twapMaxGapMs: parseInt(optionalEnv('HL_TWAP_MAX_GAP_MS', String(60 * 1000)), 10),
+        twapMinFills: parseInt(optionalEnv('HL_TWAP_MIN_FILLS', '5'), 10),
         twapCoinThresholds: {
             BTC: parseFloat(optionalEnv('HL_TWAP_BTC_MIN_USD', '19000000')),
             ETH: parseFloat(optionalEnv('HL_TWAP_ETH_MIN_USD', '8000000')),
