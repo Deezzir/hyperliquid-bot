@@ -160,14 +160,6 @@ export default class ScreenshotService {
                     username: proxy.username,
                     password: proxy.password
                 });
-            page.on('framenavigated', async (frame) => {
-                if (
-                    frame === page!.mainFrame() &&
-                    (page!.url().includes('restrictedRegion') || page!.url().includes('restricted'))
-                ) {
-                    await page!.goBack();
-                }
-            });
 
             await page.setViewport(viewport!);
             await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'dark' }]);

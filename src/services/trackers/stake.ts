@@ -367,10 +367,29 @@ export default class StakeService extends Tracker {
                     () => {
                         const modal = document.querySelector('div[data-modal-card="true"]');
                         if (!modal) return false;
-                        if (modal.querySelector('div.content .loader')) return false;
-                        return !!modal.querySelector('[data-testid="bet-outcome-label"]');
+                        if (modal.querySelector('[data-testid="component-loader"]')) return false;
+                        return !!modal.querySelector('div.content .id-wrap');
                     },
-                    undefined,
+                    async (page) => {
+                        page.on('framenavigated', (frame) => {
+                            if (frame !== page.mainFrame() || !/restrictedRegion|restricted/.test(frame.url())) {
+                                return;
+                            }
+
+                            void (async () => {
+                                await page.waitForFunction(() => document.readyState === 'complete', {
+                                    timeout: 5_000
+                                });
+                                await Promise.all([
+                                    page.waitForNavigation({
+                                        waitUntil: 'domcontentloaded',
+                                        timeout: 10_000
+                                    }),
+                                    page.goBack()
+                                ]);
+                            })();
+                        });
+                    },
                     undefined,
                     this.proxy
                 );
