@@ -171,6 +171,8 @@ export default class StakeService extends Tracker {
     private page: Page | null = null;
     private browser: Browser | null = null;
     private browserDir: string | null = null;
+    private lockdownToken: string | null = null;
+    private reconnectingPage = false;
     private betsBatch: Partial<StakeBetDocument>[] = [];
     private betsBatchInterval?: NodeJS.Timeout;
 
@@ -184,27 +186,41 @@ export default class StakeService extends Tracker {
         this.running = true;
         this.logger.info('StakeService monitoring started');
 
-        try {
-            this.browser = await this.initBrowser();
-            this.page = await this.initPage(this.browser);
-            await sleep(5000);
-            await this.setupPageEventHandlers(this.page);
-            this.logger.info(
-                `Puppeteer initialized with${this.proxy ? ` proxy ${this.proxy.host}:${this.proxy.port}` : 'out proxy'}`
-            );
+        for (let attempt = 0; attempt < config.stake.retry.maxAttempts && this.running; attempt++) {
+            try {
+                this.browser = await this.initBrowser();
+                this.page = await this.initPage(this.browser);
+                await this.cancellableSleep(5000);
+                await this.setupPageEventHandlers(this.page);
+                this.logger.info(
+                    `Puppeteer initialized with${this.proxy ? ` proxy ${this.proxy.host}:${this.proxy.port}` : 'out proxy'}`
+                );
 
-            this.betsBatchInterval = setInterval(() => {
-                this.flushBetsBatch().catch((error) => this.logger.error(`Error flushing bets batch: ${error}`));
-            }, config.stake.batchFlushIntervalMs);
+                this.betsBatchInterval = setInterval(() => {
+                    this.flushBetsBatch().catch((error) => this.logger.error(`Error flushing bets batch: ${error}`));
+                }, config.stake.batchFlushIntervalMs);
 
-            await this.subscribeBets();
-            this.monitorTask = this.mainLoop();
-        } catch (error) {
-            this.running = false;
-            this.clearBatchInterval();
-            await this.disposePuppeteer();
-            this.logger.error(`Error initializing Puppeteer: ${error}`);
+                await this.subscribeBets();
+                this.monitorTask = this.mainLoop();
+                return;
+            } catch (error) {
+                this.clearBatchInterval();
+                await this.disposePuppeteer();
+                this.logger.error(`Error initializing Puppeteer: ${error}`);
+
+                const nextAttempt = attempt + 1;
+                if (nextAttempt >= config.stake.retry.maxAttempts) break;
+                const delay = Math.min(
+                    config.stake.retry.initialDelayMs *
+                        Math.pow(config.stake.retry.backoffMultiplier, Math.max(0, nextAttempt - 1)),
+                    config.stake.retry.maxDelayMs
+                );
+                this.logger.warn(`Retrying Puppeteer initialization in ${Math.round(delay / 1000)}s`);
+                await this.cancellableSleep(delay);
+            }
         }
+
+        this.running = false;
     }
 
     async stop(): Promise<void> {
@@ -288,19 +304,64 @@ export default class StakeService extends Tracker {
     }
 
     private async initPage(browser: Browser): Promise<Page> {
+        this.lockdownToken = null;
         const page = await browser.newPage();
+        const cdp = await page.createCDPSession();
+        await cdp.send('Network.enable');
+        cdp.on('Network.webSocketFrameSent', ({ response }) => {
+            try {
+                const message = JSON.parse(response.payloadData);
+                if (message.type === 'connection_init' && message.payload?.lockdownToken) {
+                    this.lockdownToken = message.payload.lockdownToken;
+                }
+            } catch {}
+        });
         if (this.proxy)
             await page.authenticate({
                 username: this.proxy.username,
                 password: this.proxy.password
             });
 
-        await page.goto(this.url, { waitUntil: 'networkidle2' });
+        await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
         return page;
     }
 
     private async setupPageEventHandlers(page: Page): Promise<void> {
         await page.exposeFunction('onWSMessage', this.handleMessage.bind(this));
+    }
+
+    private async reconnectPage(): Promise<void> {
+        if (!this.running || this.reconnectingPage) return;
+        this.reconnectingPage = true;
+        this.logger.warn('Rebuilding Stake browser session');
+
+        try {
+            await this.disposePuppeteer();
+            for (let attempt = 0; attempt < config.stake.retry.maxAttempts && this.running; attempt++) {
+                try {
+                    this.browser = await this.initBrowser();
+                    this.page = await this.initPage(this.browser);
+                    await this.cancellableSleep(5000);
+                    await this.setupPageEventHandlers(this.page);
+                    await this.subscribeBets();
+                    this.logger.info('Stake browser session rebuilt');
+                    return;
+                } catch (error) {
+                    await this.disposePuppeteer();
+                    this.logger.error(`Error rebuilding Stake browser session: ${error}`);
+                    const nextAttempt = attempt + 1;
+                    if (nextAttempt >= config.stake.retry.maxAttempts) return;
+                    const delay = Math.min(
+                        config.stake.retry.initialDelayMs *
+                            Math.pow(config.stake.retry.backoffMultiplier, Math.max(0, nextAttempt - 1)),
+                        config.stake.retry.maxDelayMs
+                    );
+                    await this.cancellableSleep(delay);
+                }
+            }
+        } finally {
+            this.reconnectingPage = false;
+        }
     }
 
     private async mainLoop(): Promise<void> {
@@ -350,6 +411,20 @@ export default class StakeService extends Tracker {
         this.lastScanTimestamp = Date.now();
     }
 
+    private setupRestrictedRegionRecovery(page: Page): void {
+        page.on('framenavigated', (frame) => {
+            if (frame !== page.mainFrame() || !/restrictedRegion|restricted/.test(frame.url())) return;
+
+            void (async () => {
+                await page.waitForFunction(() => document.readyState === 'complete', { timeout: 5_000 });
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10_000 }),
+                    page.goBack()
+                ]);
+            })().catch((error) => this.logger.warn(`Restricted-region recovery failed: ${error}`));
+        });
+    }
+
     private async processAlertCandidate(candidate: StakeBetRecord): Promise<void> {
         this.logger.info(
             `Sending alert for high-value bet: IID ${candidate.iid} ${formatCurrency(candidate.amountUSD)}`
@@ -370,26 +445,7 @@ export default class StakeService extends Tracker {
                         if (modal.querySelector('[data-testid="component-loader"]')) return false;
                         return !!modal.querySelector('div.content .id-wrap');
                     },
-                    async (page) => {
-                        page.on('framenavigated', (frame) => {
-                            if (frame !== page.mainFrame() || !/restrictedRegion|restricted/.test(frame.url())) {
-                                return;
-                            }
-
-                            void (async () => {
-                                await page.waitForFunction(() => document.readyState === 'complete', {
-                                    timeout: 5_000
-                                });
-                                await Promise.all([
-                                    page.waitForNavigation({
-                                        waitUntil: 'domcontentloaded',
-                                        timeout: 10_000
-                                    }),
-                                    page.goBack()
-                                ]);
-                            })();
-                        });
-                    },
+                    async (page) => this.setupRestrictedRegionRecovery(page),
                     undefined,
                     this.proxy
                 );
@@ -545,7 +601,13 @@ export default class StakeService extends Tracker {
 
         const allSportsPayload = allSportBetsPayload;
         const highrollerPayload = highrollerSportBetsPayload;
-        const startPayload = { type: 'connection_init', payload: { language: 'en' } };
+        const startPayload = {
+            type: 'connection_init',
+            payload: {
+                language: 'en',
+                ...(this.lockdownToken ? { lockdownToken: this.lockdownToken } : {})
+            }
+        };
         const wssUrl = config.stake.wss;
         const retry = config.stake.retry;
 
@@ -567,53 +629,36 @@ export default class StakeService extends Tracker {
                     );
                 };
 
-                type WsSlot = {
-                    name: string;
-                    wsKey: 'wsAll' | 'wsHighroller';
-                    intervalKey: 'pingIntervalAll' | 'pingIntervalHighroller';
-                    reconnectKey: 'reconnectTimerAll' | 'reconnectTimerHighroller';
-                    attemptsKey: 'reconnectAttemptsAll' | 'reconnectAttemptsHighroller';
-                    subscriptionPayload: Payload;
-                };
-
                 if (!(window as any).stakeWSManager) {
                     (window as any).stakeWSManager = {};
                 }
                 const manager = (window as any).stakeWSManager;
 
-                const allSlot: WsSlot = {
-                    name: 'AllSportBets',
-                    wsKey: 'wsAll',
-                    intervalKey: 'pingIntervalAll',
-                    reconnectKey: 'reconnectTimerAll',
-                    attemptsKey: 'reconnectAttemptsAll',
-                    subscriptionPayload: allSportsPayload
-                };
-                const highrollerSlot: WsSlot = {
-                    name: 'HighrollerSportBets',
-                    wsKey: 'wsHighroller',
-                    intervalKey: 'pingIntervalHighroller',
-                    reconnectKey: 'reconnectTimerHighroller',
-                    attemptsKey: 'reconnectAttemptsHighroller',
-                    subscriptionPayload: highrollerPayload
-                };
+                const subscriptions = [allSportsPayload, highrollerPayload];
 
-                const clearPing = (slot: WsSlot) => {
-                    if (manager[slot.intervalKey]) {
-                        clearInterval(manager[slot.intervalKey]);
-                        manager[slot.intervalKey] = null;
+                const clearPing = () => {
+                    if (manager.pingInterval) {
+                        clearInterval(manager.pingInterval);
+                        manager.pingInterval = null;
                     }
                 };
 
-                const clearReconnectTimer = (slot: WsSlot) => {
-                    if (manager[slot.reconnectKey]) {
-                        clearTimeout(manager[slot.reconnectKey]);
-                        manager[slot.reconnectKey] = null;
+                const clearReconnectTimer = () => {
+                    if (manager.reconnectTimer) {
+                        clearTimeout(manager.reconnectTimer);
+                        manager.reconnectTimer = null;
                     }
                 };
 
-                const closeSocket = (slot: WsSlot, silent = false) => {
-                    const ws = manager[slot.wsKey] as WebSocket | null;
+                const clearAcknowledgementTimeout = () => {
+                    if (manager.acknowledgementTimeout) {
+                        clearTimeout(manager.acknowledgementTimeout);
+                        manager.acknowledgementTimeout = null;
+                    }
+                };
+
+                const closeSocket = (silent = false) => {
+                    const ws = manager.ws as WebSocket | null;
                     if (!ws) return;
                     if (silent) {
                         ws.onopen = null;
@@ -624,16 +669,14 @@ export default class StakeService extends Tracker {
                     try {
                         ws.close();
                     } catch {}
-                    manager[slot.wsKey] = null;
+                    manager.ws = null;
                 };
 
-                const getAttempts = (slot: WsSlot): number => Number(manager[slot.attemptsKey] ?? 0);
+                const scheduleReconnect = (reason: string) => {
+                    if (manager.reconnectTimer) return;
 
-                const scheduleReconnect = (slot: WsSlot, reason: string) => {
-                    if (manager[slot.reconnectKey]) return;
-
-                    const nextAttempt = getAttempts(slot) + 1;
-                    manager[slot.attemptsKey] = nextAttempt;
+                    const nextAttempt = Number(manager.reconnectAttempts ?? 0) + 1;
+                    manager.reconnectAttempts = nextAttempt;
 
                     const delay = Math.min(
                         retry.initialDelayMs * Math.pow(retry.backoffMultiplier, Math.max(0, nextAttempt - 1)),
@@ -641,29 +684,34 @@ export default class StakeService extends Tracker {
                     );
 
                     log(
-                        `WebSocket (${slot.name}) reconnecting in ${Math.round(delay / 1000)}s (attempt ${nextAttempt}, reason: ${reason})`,
+                        `WebSocket reconnecting in ${Math.round(delay / 1000)}s (attempt ${nextAttempt}, reason: ${reason})`,
                         'warn'
                     );
 
-                    manager[slot.reconnectKey] = setTimeout(() => {
-                        manager[slot.reconnectKey] = null;
-                        connect(slot);
+                    manager.reconnectTimer = setTimeout(() => {
+                        manager.reconnectTimer = null;
+                        connect();
                     }, delay);
                 };
 
-                const connect = (slot: WsSlot) => {
-                    clearPing(slot);
-                    clearReconnectTimer(slot);
-                    closeSocket(slot, true);
+                const connect = () => {
+                    clearPing();
+                    clearReconnectTimer();
+                    closeSocket(true);
 
                     const ws = new WebSocket(wssUrl, 'graphql-transport-ws');
-                    manager[slot.wsKey] = ws;
+                    manager.ws = ws;
 
                     ws.onopen = () => {
-                        manager[slot.attemptsKey] = 0;
-                        log(`WebSocket (${slot.name}) connected`, 'info');
+                        manager.reconnectAttempts = 0;
+                        log('WebSocket connected', 'info');
                         ws.send(JSON.stringify(startPayload));
-                        manager[slot.intervalKey] = setInterval(() => {
+                        manager.acknowledgementTimeout = setTimeout(() => {
+                            log('WebSocket connection acknowledgement timed out', 'warn');
+                            (window as any).onWSMessage(JSON.stringify({ type: 'session_expired' }));
+                            ws.close();
+                        }, 10_000);
+                        manager.pingInterval = setInterval(() => {
                             if (ws.readyState === WebSocket.OPEN) {
                                 ws.send(JSON.stringify({ type: 'ping' }));
                             }
@@ -679,8 +727,9 @@ export default class StakeService extends Tracker {
                         }
 
                         if (data.type === 'connection_ack') {
-                            log(`WebSocket (${slot.name}) connection acknowledged`, 'info');
-                            ws.send(JSON.stringify(slot.subscriptionPayload));
+                            clearAcknowledgementTimeout();
+                            log('WebSocket connection acknowledged', 'info');
+                            for (const subscription of subscriptions) ws.send(JSON.stringify(subscription));
                             return;
                         }
                         if (data.type === 'ping') {
@@ -693,36 +742,33 @@ export default class StakeService extends Tracker {
                     };
 
                     ws.onerror = (err: Event) => {
-                        log(`WebSocket (${slot.name}) error: ${err.type}`, 'error');
+                        log(`WebSocket error: ${err.type}`, 'error');
                         try {
                             ws.close();
                         } catch {}
                     };
 
                     ws.onclose = (event: CloseEvent) => {
-                        if (manager[slot.wsKey] !== ws) return;
+                        if (manager.ws !== ws) return;
 
-                        manager[slot.wsKey] = null;
-                        clearPing(slot);
+                        manager.ws = null;
+                        clearPing();
+                        clearAcknowledgementTimeout();
 
-                        log(
-                            `WebSocket (${slot.name}) closed (code=${event.code}, reason=${event.reason || 'none'}).`,
-                            'warn'
-                        );
+                        log(`WebSocket closed (code=${event.code}, reason=${event.reason || 'none'}).`, 'warn');
 
-                        scheduleReconnect(slot, `close:${event.code}`);
+                        if (event.code === 4401 || event.code === 4403) {
+                            (window as any).onWSMessage(JSON.stringify({ type: 'session_expired' }));
+                            return;
+                        }
+                        scheduleReconnect(`close:${event.code}`);
                     };
                 };
 
-                clearReconnectTimer(allSlot);
-                clearReconnectTimer(highrollerSlot);
-                closeSocket(allSlot, true);
-                closeSocket(highrollerSlot, true);
-                manager[allSlot.attemptsKey] = 0;
-                manager[highrollerSlot.attemptsKey] = 0;
-
-                connect(allSlot);
-                connect(highrollerSlot);
+                clearReconnectTimer();
+                closeSocket(true);
+                manager.reconnectAttempts = 0;
+                connect();
             },
             wssUrl,
             startPayload,
@@ -756,6 +802,10 @@ export default class StakeService extends Tracker {
             const parsed = JSON.parse(message);
             if (parsed.type === 'log') {
                 this.handleBrowserLog(parsed);
+                return;
+            }
+            if (parsed.type === 'session_expired') {
+                await this.reconnectPage();
                 return;
             }
             if (parsed.type !== 'next') return;
