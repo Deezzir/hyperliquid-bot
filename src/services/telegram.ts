@@ -5,21 +5,8 @@ import { InlineKeyboardMarkup, InputFile } from 'telegraf/types';
 import { getRedisClient } from './redis';
 import { HyperliquidService, StakeService, PolymarketService, CoinglassService, trackerNames } from './trackers';
 import { retry } from '../common/utils';
-import { writeDiagnostic } from '../common/diagnostics';
 
 const logger = new Logger('Telegram');
-
-function describeError(error: unknown, depth = 0): Record<string, unknown> {
-    if (!(error instanceof Error)) return { value: String(error) };
-    const withCode = error as Error & { code?: string; errno?: string | number; cause?: unknown };
-    return {
-        name: error.name,
-        message: error.message,
-        code: withCode.code,
-        errno: withCode.errno,
-        cause: withCode.cause && depth < 2 ? describeError(withCode.cause, depth + 1) : undefined
-    };
-}
 
 interface SendMessageOptions {
     reply_markup?: InlineKeyboardMarkup;
@@ -30,7 +17,6 @@ export default class TelegramService {
     private bot: Telegraf;
     private handlerRegistrar?: (tg: TelegramService) => void;
     private allChatIDs: number[];
-    private requestsInFlight = 0;
 
     constructor() {
         this.bot = new Telegraf(config.telegram.botToken);
@@ -243,14 +229,12 @@ export default class TelegramService {
         const MAX_RETRIES = 3;
         return retry(
             async () => {
-                const msg = await this.runTelegramRequest('sendMessage', () =>
-                    this.bot.telegram.sendMessage(chatID, message, {
-                        parse_mode: 'HTML',
-                        link_preview_options: { is_disabled: true },
-                        reply_markup: extra?.reply_markup,
-                        message_thread_id: extra?.message_thread_id
-                    })
-                );
+                const msg = await this.bot.telegram.sendMessage(chatID, message, {
+                    parse_mode: 'HTML',
+                    link_preview_options: { is_disabled: true },
+                    reply_markup: extra?.reply_markup,
+                    message_thread_id: extra?.message_thread_id
+                });
                 return msg.message_id;
             },
             { attempts: MAX_RETRIES },
@@ -274,14 +258,12 @@ export default class TelegramService {
                     source: photo,
                     filename: `photo_${Date.now()}.jpg`
                 };
-                const msg = await this.runTelegramRequest('sendPhoto', () =>
-                    this.bot.telegram.sendPhoto(chatID, inputFile, {
-                        caption: oversized ? undefined : caption,
-                        parse_mode: oversized ? undefined : 'HTML',
-                        reply_markup: oversized ? undefined : extra?.reply_markup,
-                        message_thread_id: extra?.message_thread_id
-                    })
-                );
+                const msg = await this.bot.telegram.sendPhoto(chatID, inputFile, {
+                    caption: oversized ? undefined : caption,
+                    parse_mode: oversized ? undefined : 'HTML',
+                    reply_markup: oversized ? undefined : extra?.reply_markup,
+                    message_thread_id: extra?.message_thread_id
+                });
                 return msg.message_id;
             },
             { attempts: MAX_RETRIES },
@@ -307,38 +289,17 @@ export default class TelegramService {
         const MAX_RETRIES = 3;
         await retry(
             async () => {
-                await this.runTelegramRequest('sendReply', () =>
-                    this.bot.telegram.sendMessage(chatID, text, {
-                        parse_mode: 'HTML',
-                        link_preview_options: { is_disabled: true },
-                        reply_parameters: { message_id: replyToMessageId },
-                        message_thread_id: extras?.message_thread_id,
-                        reply_markup: extras?.reply_markup
-                    })
-                );
+                await this.bot.telegram.sendMessage(chatID, text, {
+                    parse_mode: 'HTML',
+                    link_preview_options: { is_disabled: true },
+                    reply_parameters: { message_id: replyToMessageId },
+                    message_thread_id: extras?.message_thread_id,
+                    reply_markup: extras?.reply_markup
+                });
             },
             { attempts: MAX_RETRIES },
             logger
         );
-    }
-
-    private async runTelegramRequest<T>(method: string, operation: () => Promise<T>): Promise<T> {
-        const startedAt = Date.now();
-        const inFlight = ++this.requestsInFlight;
-        try {
-            return await operation();
-        } catch (error) {
-            const diagnostics = {
-                elapsedMs: Date.now() - startedAt,
-                inFlight,
-                error: describeError(error)
-            };
-            writeDiagnostic('Telegram', `${method}-failed`, diagnostics);
-            logger.warn(`Telegram API ${method} failed`, diagnostics);
-            throw error;
-        } finally {
-            this.requestsInFlight--;
-        }
     }
 
     public async checkMessageSource(ctx: Context, chatID: number | number[], requireOwner: boolean): Promise<boolean> {
