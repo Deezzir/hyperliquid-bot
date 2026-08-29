@@ -15,6 +15,7 @@ import { InlineKeyboardMarkup } from 'telegraf/types';
 import { capitalize, formatCurrency, sleep } from '../../common/utils';
 import { createBrowserDir, removeBrowserDir } from '../../common/browser-dir';
 import puppeteer from 'puppeteer-extra';
+import { writeDiagnostic } from '../../common/diagnostics';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import ProxyService, { Proxy } from '../proxies';
 import { getRedisClient } from '../redis';
@@ -415,13 +416,46 @@ export default class StakeService extends Tracker {
         page.on('framenavigated', (frame) => {
             if (frame !== page.mainFrame() || !/restrictedRegion|restricted/.test(frame.url())) return;
 
+            const startedAt = Date.now();
+            const restrictedUrl = frame.url();
             void (async () => {
                 await page.waitForFunction(() => document.readyState === 'complete', { timeout: 5_000 });
                 await Promise.all([
                     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10_000 }),
                     page.goBack()
                 ]);
-            })().catch((error) => this.logger.warn(`Restricted-region recovery failed: ${error}`));
+            })().catch(async (error) => {
+                let documentState: unknown = null;
+                try {
+                    documentState = await page.evaluate(() => ({
+                        url: location.href,
+                        title: document.title,
+                        readyState: document.readyState,
+                        bodyTextLength: document.body?.innerText.length ?? 0,
+                        bodyTextPreview: document.body?.innerText.replace(/\s+/g, ' ').slice(0, 300) ?? ''
+                    }));
+                } catch (inspectionError) {
+                    documentState = {
+                        inspectionError:
+                            inspectionError instanceof Error ? inspectionError.message : String(inspectionError)
+                    };
+                }
+                const diagnostics = {
+                    elapsedMs: Date.now() - startedAt,
+                    restrictedUrl,
+                    pageUrl: page.url(),
+                    frames: page
+                        .frames()
+                        .map((currentFrame) => currentFrame.url())
+                        .filter(Boolean),
+                    document: documentState
+                };
+                writeDiagnostic('StakeService', 'restricted-region-recovery-failed', {
+                    error: String(error),
+                    ...diagnostics
+                });
+                this.logger.warn(`Restricted-region recovery failed: ${error}`, diagnostics);
+            });
         });
     }
 

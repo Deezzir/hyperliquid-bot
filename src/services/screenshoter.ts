@@ -7,9 +7,17 @@ import { retry } from '../common/utils';
 import { createBrowserDir, removeBrowserDir } from '../common/browser-dir';
 import { Mutex } from '../common/mutex';
 import { config } from '../config';
+import { writeDiagnostic } from '../common/diagnostics';
 
 const logger = new Logger('Screenshoter');
 puppeteer.use(StealthPlugin());
+
+interface CaptureNetworkDiagnostics {
+    started: number;
+    finished: number;
+    failed: number;
+    recentFailures: { url: string; error: string }[];
+}
 
 export default class ScreenshotService {
     private browser: Browser | null = null;
@@ -135,6 +143,8 @@ export default class ScreenshotService {
         let context: Awaited<ReturnType<Browser['createBrowserContext']>> | null = null;
         let captureTimer: NodeJS.Timeout | null = null;
         let captureTimedOut = false;
+        const startedAt = Date.now();
+        const network: CaptureNetworkDiagnostics = { started: 0, finished: 0, failed: 0, recentFailures: [] };
 
         try {
             if (!this.browser || !this.browser.connected) await this.start();
@@ -148,6 +158,22 @@ export default class ScreenshotService {
                 page = await this.browser!.newPage();
             }
             if (!page) throw new Error('Failed to create a new page');
+
+            page.on('request', () => network.started++);
+            page.on('requestfinished', () => network.finished++);
+            page.on('requestfailed', (request) => {
+                network.failed++;
+                let resourceUrl = request.url();
+                try {
+                    const parsed = new URL(resourceUrl);
+                    resourceUrl = `${parsed.origin}${parsed.pathname}`;
+                } catch {}
+                network.recentFailures.push({
+                    url: resourceUrl.slice(0, 300),
+                    error: request.failure()?.errorText ?? 'unknown'
+                });
+                if (network.recentFailures.length > 10) network.recentFailures.shift();
+            });
 
             captureTimer = setTimeout(() => {
                 captureTimedOut = true;
@@ -179,7 +205,12 @@ export default class ScreenshotService {
                         polling: 1000
                     });
                 } catch (err) {
-                    logger.warn(`waitFn timed out for ${url}, capturing current state: ${err}`);
+                    const diagnostics = {
+                        elapsedMs: Date.now() - startedAt,
+                        ...(await this.getPageDiagnostics(page, selector, network))
+                    };
+                    writeDiagnostic('Screenshoter', 'waitFn-timeout', { url, error: String(err), ...diagnostics });
+                    logger.warn(`waitFn timed out for ${url}, capturing current state: ${err}`, diagnostics);
                 }
             }
 
@@ -195,19 +226,84 @@ export default class ScreenshotService {
             const screenshot = await page.screenshot({ type: 'png' });
             return Buffer.from(screenshot);
         } catch (err) {
+            const diagnostics = page
+                ? {
+                      elapsedMs: Date.now() - startedAt,
+                      ...(await this.getPageDiagnostics(page, selector, network))
+                  }
+                : { elapsedMs: Date.now() - startedAt, network };
             if (captureTimedOut) {
                 const timeoutError = new Error(
                     `Screenshot capture timed out after ${ScreenshotService.CAPTURE_TIMEOUT_MS}ms`
                 );
-                logger.error(`Screenshot failed for ${url}: ${timeoutError}`);
+                writeDiagnostic('Screenshoter', 'capture-timeout', {
+                    url,
+                    error: timeoutError.message,
+                    ...diagnostics
+                });
+                logger.error(`Screenshot failed for ${url}: ${timeoutError}`, diagnostics);
                 throw timeoutError;
             }
-            logger.error(`Screenshot failed for ${url}: ${err}`);
+            writeDiagnostic('Screenshoter', 'capture-failed', { url, error: String(err), ...diagnostics });
+            logger.error(`Screenshot failed for ${url}: ${err}`, diagnostics);
             throw err;
         } finally {
             if (captureTimer) clearTimeout(captureTimer);
             if (page) await page.close().catch(() => {});
             if (context) await context.close().catch(() => {});
         }
+    }
+
+    private async getPageDiagnostics(
+        page: Page,
+        selector: string | undefined,
+        network: CaptureNetworkDiagnostics
+    ): Promise<Record<string, unknown>> {
+        let documentState: Record<string, unknown> | null = null;
+        try {
+            documentState = await page.evaluate((targetSelector) => {
+                const modal = document.querySelector('div[data-modal-card="true"]');
+                const navigation = performance.getEntriesByType('navigation')[0] as
+                    PerformanceNavigationTiming | undefined;
+                return {
+                    url: location.href,
+                    title: document.title,
+                    readyState: document.readyState,
+                    visibilityState: document.visibilityState,
+                    bodyTextLength: document.body?.innerText.length ?? 0,
+                    bodyHtmlLength: document.body?.innerHTML.length ?? 0,
+                    bodyTextPreview: document.body?.innerText.replace(/\s+/g, ' ').slice(0, 300) ?? '',
+                    selectorFound: targetSelector ? !!document.querySelector(targetSelector) : null,
+                    modalFound: !!modal,
+                    modalTextLength: modal?.textContent?.length ?? 0,
+                    modalLoaderFound: !!modal?.querySelector('[data-testid="component-loader"]'),
+                    modalIdFound: !!modal?.querySelector('div.content .id-wrap'),
+                    navigation: navigation
+                        ? {
+                              domContentLoadedMs: Math.round(navigation.domContentLoadedEventEnd),
+                              loadMs: Math.round(navigation.loadEventEnd),
+                              responseMs: Math.round(navigation.responseEnd),
+                              transferredBytes: navigation.transferSize
+                          }
+                        : null,
+                    resourcesLoaded: performance.getEntriesByType('resource').length
+                };
+            }, selector);
+        } catch (error) {
+            documentState = { inspectionError: error instanceof Error ? error.message : String(error) };
+        }
+
+        return {
+            pageUrl: page.url(),
+            frames: page
+                .frames()
+                .map((frame) => frame.url())
+                .filter(Boolean),
+            document: documentState,
+            network: {
+                ...network,
+                pending: Math.max(0, network.started - network.finished - network.failed)
+            }
+        };
     }
 }
