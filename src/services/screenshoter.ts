@@ -184,12 +184,22 @@ export default class ScreenshotService {
             }
 
             if (selector) {
-                const element = await page.waitForSelector(selector, {
-                    timeout: ScreenshotService.SELECTOR_TIMEOUT_MS
-                });
-                if (!element) throw new Error(`Element not found: ${selector}`);
-                const screenshot = await element.screenshot({ type: 'png' });
-                return Buffer.from(screenshot);
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const element = await page.waitForSelector(selector, {
+                        timeout: ScreenshotService.SELECTOR_TIMEOUT_MS
+                    });
+                    if (!element) throw new Error(`Element not found: ${selector}`);
+
+                    try {
+                        const screenshot = await element.screenshot({ type: 'png' });
+                        return Buffer.from(screenshot);
+                    } catch (error) {
+                        if (attempt > 0 || !String(error).includes('Node is detached from document')) throw error;
+                        logger.warn(`Element detached while capturing ${url}; retrying selector ${selector}`);
+                    } finally {
+                        await element.dispose().catch(() => {});
+                    }
+                }
             }
 
             const screenshot = await page.screenshot({ type: 'png' });
