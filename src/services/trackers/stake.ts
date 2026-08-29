@@ -419,7 +419,7 @@ export default class StakeService extends Tracker {
             const startedAt = Date.now();
             const restrictedUrl = frame.url();
             void (async () => {
-                await page.waitForFunction(() => document.readyState === 'complete', { timeout: 5_000 });
+                await page.waitForFunction(() => document.readyState === 'complete', { timeout: 15_000 });
                 await Promise.all([
                     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10_000 }),
                     page.goBack()

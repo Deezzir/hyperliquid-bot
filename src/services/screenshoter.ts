@@ -26,7 +26,7 @@ export default class ScreenshotService {
     private refCount = 0;
     private readonly captureQueue = new Mutex();
 
-    private static readonly CAPTURE_TIMEOUT_MS = 35_000;
+    private static readonly CAPTURE_TIMEOUT_MS = 60_000;
     private static readonly NAVIGATION_TIMEOUT_MS = 20_000;
     private static readonly SELECTOR_TIMEOUT_MS = 10_000;
 
